@@ -5,8 +5,14 @@ import logging
 import shutil
 import time
 from datetime import datetime
-
-import requests  # para atualização (atualmente comentada)
+import re
+import asyncio
+import psutil
+from logging.handlers import RotatingFileHandler
+from PyQt5.QtCore import QTimer
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtWidgets import QSystemTrayIcon
+import requests
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
                              QTabWidget, QLineEdit, QRadioButton, QButtonGroup, QPushButton, QComboBox,
@@ -17,8 +23,146 @@ from PyQt5.QtGui import QFont, QIcon
 
 from yt_dlp import YoutubeDL
 
+
+from queue import PriorityQueue
+from dataclasses import dataclass
+from datetime import datetime
+
+import shelve
+from functools import lru_cache
+
+
 # Versão atual do aplicativo (definida como 0.0.3)
 CURRENT_VERSION = "0.0.3"
+
+
+# ------------------------------
+# Sistema de Filas com Prioridade
+# ------------------------------
+@dataclass
+class DownloadPriority:
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+
+class PriorityDownloadQueue:
+    def __init__(self):
+        self.queue = PriorityQueue()
+        self.current_downloads = {}
+        self.max_concurrent = 3
+
+    def add_download(self, download_item, priority=DownloadPriority.NORMAL):
+        timestamp = datetime.now().timestamp()
+        self.queue.put((priority, timestamp, download_item))
+        self.process_queue()
+
+    def process_queue(self):
+        while (not self.queue.empty() and 
+               len(self.current_downloads) < self.max_concurrent):
+            priority, _, item = self.queue.get()
+            self.start_download(item)
+
+
+#
+#Performance - cache de download
+#
+
+class DownloadCache:
+    def __init__(self, cache_file="download_cache"):
+        self.cache_file = cache_file
+
+    def save_to_cache(self, url, info):
+        with shelve.open(self.cache_file) as cache:
+            cache[url] = {
+                'info': info,
+                'timestamp': datetime.now().timestamp()
+            }
+
+    @lru_cache(maxsize=100)
+    def get_from_cache(self, url):
+        with shelve.open(self.cache_file) as cache:
+            data = cache.get(url)
+            if data and (datetime.now().timestamp() - data['timestamp']) < 86400:
+                return data['info']
+        return None
+
+#
+# Gerenciamento de memória
+#
+
+class MemoryManager:
+    def __init__(self):
+        self.memory_threshold = 85  # porcentagem
+        self.check_interval = 300  # segundos
+
+    def start_monitoring(self):
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.check_memory_usage)
+        self.timer.start(self.check_interval * 1000)
+
+    def check_memory_usage(self):
+        memory_use = psutil.virtual_memory().percent
+        if memory_use > self.memory_threshold:
+            self.clean_up_resources()
+
+    def clean_up_resources(self):
+        # Limpar downloads concluídos
+        # Limpar cache antigo
+        # Remover arquivos temporários
+        pass
+
+
+#
+#SEGURANÇA - verificador de URL
+#
+
+class URLValidator:
+    def __init__(self):
+        self.patterns = {
+            'youtube': r'^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\/.+$',
+            'instagram': r'^https?:\/\/(www\.)?instagram\.com\/(p|reel|tv)\/.+$',
+            'twitch': r'^https?:\/\/(www\.)?twitch\.tv\/.+$'
+        }
+
+    def validate_url(self, url: str) -> tuple[bool, str]:
+        for platform, pattern in self.patterns.items():
+            if re.match(pattern, url):
+                return True, platform
+        return False, ""
+
+    def sanitize_filename(self, filename: str) -> str:
+        # Remove caracteres inválidos do nome do arquivo
+        return re.sub(r'[<>:"/\\|?*]', '', filename)
+
+#
+#Sistema de Logs aprimorado
+#
+
+class EnhancedLogger:
+    def __init__(self, log_file="downloads.log"):
+        self.log_file = log_file
+        self.setup_logger()
+
+    def setup_logger(self):
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        file_handler = RotatingFileHandler(
+            self.log_file,
+            maxBytes=5*1024*1024,  # 5MB
+            backupCount=3
+        )
+        file_handler.setFormatter(formatter)
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        
+        logger = logging.getLogger()
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+        logger.setLevel(logging.INFO)
 
 # -----------------------------------------------------------------------------
 # Função para buscar atualizações automaticamente (comentada para uso futuro)
@@ -653,7 +797,123 @@ class DownloadApp(QMainWindow):
                 self.update_download(item.id, item.progress, item.status)
                 logging.info(f"Download cancelado: {item.url}")
                 break
+# -------------------------------------
+# Barra de Progresso Aprimorada
+# ------------------------------------            
+class EnhancedProgressBar(QProgressBar):
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #555;
+                border-radius: 5px;
+                text-align: center;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #E53935, stop:1 #D32F2F);
+                border-radius: 3px;
+            }
+        """)
+        
+    def setProgress(self, progress, speed=None, eta=None):
+        self.setValue(int(progress))
+        if speed and eta:
+            self.setFormat(f"{progress:.1f}% - {speed}/s - ETA: {eta}")
+        else:
+            self.setFormat(f"{progress:.1f}%")
 
+#-------------------------------
+# Mini player para preview 
+#-----------------------------------
+class VideoPreviewWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.layout = QVBoxLayout()
+        self.preview_label = QLabel()
+        self.preview_label.setMinimumSize(320, 180)
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(self.preview_label)
+        self.setLayout(self.layout)
+
+    def update_preview(self, thumbnail_url):
+        # Baixar e exibir thumbnail do vídeo
+        response = requests.get(thumbnail_url)
+        image = QImage.fromData(response.content)
+        pixmap = QPixmap.fromImage(image).scaled(320, 180, Qt.KeepAspectRatio)
+        self.preview_label.setPixmap(pixmap)
+
+#
+# Gerenciador de notificações
+#
+
+class NotificationSystem:
+    def __init__(self):
+        self.notification_icon = QSystemTrayIcon()
+        self.setup_tray_icon()
+
+    def setup_tray_icon(self):
+        icon = QIcon('ico.ico')
+        self.notification_icon.setIcon(icon)
+        self.notification_icon.setVisible(True)
+
+    def notify(self, title, message, level="info"):
+        icon_map = {
+            "info": QSystemTrayIcon.Information,
+            "warning": QSystemTrayIcon.Warning,
+            "error": QSystemTrayIcon.Critical,
+            "success": QSystemTrayIcon.Information
+        }
+        self.notification_icon.showMessage(
+            title,
+            message,
+            icon_map.get(level, QSystemTrayIcon.Information),
+            3000
+        )
+
+#
+# Detector Automático de Qualidade
+#
+
+class QualityDetector:
+    def __init__(self):
+        self.formats = {}
+
+    async def detect_formats(self, url):
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True
+        }
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = await self.run_ydl(ydl, url)
+                formats = info.get('formats', [])
+                return self.parse_formats(formats)
+            except Exception as e:
+                logging.error(f"Erro ao detectar formatos: {e}")
+                return []
+
+    def parse_formats(self, formats):
+        parsed = []
+        for fmt in formats:
+            quality = {
+                'format_id': fmt.get('format_id'),
+                'ext': fmt.get('ext'),
+                'height': fmt.get('height'),
+                'filesize': fmt.get('filesize'),
+                'tbr': fmt.get('tbr')
+            }
+            parsed.append(quality)
+        return parsed
+
+    @staticmethod
+    async def run_ydl(ydl, url):
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ydl.extract_info(url, download=False)
+        )
 # -----------------------------------------------------------------------------
 # Execução da Aplicação
 # -----------------------------------------------------------------------------
